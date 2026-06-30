@@ -146,6 +146,15 @@ create_qcomflash_pkg() {
             install -d spinor
             find "${DEPLOY_DIR_IMAGE}/${QCOM_BOOT_FILES_SUBDIR}/spinor" -maxdepth 1 -type f -exec install -m 0644 {} spinor \;
 
+            # Prefer the OEM-cert-injected uefi_dtbs deployed by the capsule
+            # recipe when available.  Mirrors the xbl_config-with-oem-cert
+            # substitution above, but for SPI-NOR-boot targets (e.g. hamoa)
+            # where QcCapsuleRootCert lives inside uefi_dtbs.elf.
+            if [ -n "${QCOM_CAPSULE_FIRMWARE}" ] && \
+                    [ -f "${DEPLOY_DIR_IMAGE}/uefi_dtbs-with-oem-cert.xz" ]; then
+                install -m 0644 "${DEPLOY_DIR_IMAGE}/uefi_dtbs-with-oem-cert.xz" spinor/uefi_dtbs.xz
+            fi
+
             # partition bins/xml files
             if [ -n "${QCOM_PARTITION_FILES_SUBDIR_SPINOR}" ]; then
                 deploy_partition_files ${DEPLOY_DIR_IMAGE}/${QCOM_PARTITION_FILES_SUBDIR_SPINOR} spinor

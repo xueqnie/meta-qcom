@@ -254,6 +254,140 @@ print(";".join("0x%08x" % w for w in words))
     touch "${CAPSULE_DIR}/.xbl_with_oem_cert"
 }
 
+# Inject the OEM root certificate into uefi_dtbs.elf using QDTE.
+#
+# Newer platforms (hamoa/IQ-X7181, and similar SPINOR-boot parts) carry
+# QcCapsuleRootCert inside uefi_dtbs.elf -- shipped compressed as
+# uefi_dtbs.xz -- rather than in xbl_config.elf.  That ELF embeds several
+# DTBs, and on hamoa more than one of them carries the property, each at a
+# different node path (e.g. the base DTB at /sw/uefi/uefiplat and a .dtbo
+# overlay at /fragment@N/__overlay__/uefi/uefiplat).  Rather than hardcode
+# names/paths per machine, auto-detect them: scan the embedded DTBs, and
+# for every DTB that defines QcCapsuleRootCert build a QDTE --modify op
+# targeting that DTB's QDTE name at its actual node path.  QDTE names a DTB
+# after its /compatible string (with a trailing 'o' for overlays carrying
+# /__fixups__), which the helper reproduces so the names match QDTE's own
+# disassembly output.
+#
+# QDTE applies all ops in a single --nogui invocation (ops joined by '&'),
+# reassembles natively (see qdte 0006, no sectools), and we re-compress.
+#
+# $1 - path to uefi_dtbs.xz (a sibling uefi_dtbs-with-oem-cert.xz is staged
+#      in place on success)
+patch_uefi_dtbs_cert() {
+    local uefi_dtbs_xz="$1"
+    local staged_dir
+    staged_dir=$(dirname "${uefi_dtbs_xz}")
+
+    # Decompress to the raw ELF QDTE consumes (keep the .xz around).
+    local uefi_dtbs_elf="${uefi_dtbs_xz%.xz}"
+    rm -f "${uefi_dtbs_elf}"
+    xz -dk "${uefi_dtbs_xz}"
+
+    # Pack the DER cert into QDTE's word-array --modify syntax (identical
+    # encoding to patch_xblconfig_cert above).
+    QDTE_CERT_VALUE=$(python3 -c '
+import struct, sys
+data = open(sys.argv[1], "rb").read()
+pad = (-len(data)) % 4
+padded = data + b"\x00" * pad
+words = [len(data)] + list(struct.unpack(">%dI" % (len(padded) // 4), padded))
+print(";".join("0x%08x" % w for w in words))
+' "${CAPSULE_ROOT_CER}")
+
+    # Auto-detect the (dtb-name, node-path) targets.  Emits one
+    # "<qdte-name><node-path>" line per cert-bearing DTB; the node path
+    # begins with '/', so concatenation yields a valid QDTE op prefix.
+    # pyfdt is on PATH via qdte-native's sysroot dependency.
+    local targets
+    targets=$(python3 -c '
+import struct, sys
+from pyfdt.pyfdt import FdtBlobParse
+try:
+    from io import BytesIO
+except ImportError:
+    BytesIO = None
+
+PROP = "QcCapsuleRootCert"
+data = open(sys.argv[1], "rb").read()
+magic = struct.pack(">I", 0xd00dfeed)
+off = 0
+while True:
+    idx = data.find(magic, off)
+    if idx == -1:
+        break
+    size = struct.unpack(">I", data[idx + 4:idx + 8])[0]
+    blob = data[idx:idx + size]
+    off = idx + 4
+    fdt = FdtBlobParse(BytesIO(blob)).to_fdt()
+    # QDTE names a DTB "<compatible>.dtb" (board-id variants take priority),
+    # appending a trailing "o" -> ".dtbo" when the DTB is an overlay
+    # (/__fixups__ present).  Reproduce that so names match QDTE disassembly.
+    name = None
+    for p in ("/board-id/proc-name", "/board-id/compatible", "/compatible"):
+        node = fdt.resolve_path(p)
+        if node:
+            name = node.__getitem__(0)
+            break
+    if not name:
+        continue
+    name = name + ".dtb"
+    if fdt.resolve_path("/__fixups__"):
+        name = name + "o"
+    # Find the node path that defines QcCapsuleRootCert.
+    dts = fdt.to_dts()
+    path = []
+    found = None
+    for line in dts.splitlines():
+        s = line.strip()
+        if s.endswith("{"):
+            path.append(s[:-1].strip())
+        elif s == "};" and path:
+            path.pop()
+        elif s.startswith(PROP):
+            # Drop the synthetic root label ("/") pyfdt emits for the top node.
+            found = "/" + "/".join(p for p in path if p and p != "/")
+            break
+    if found is not None:
+        print("%s%s/%s" % (name, found, PROP))
+' "${uefi_dtbs_elf}")
+
+    if [ -z "${targets}" ]; then
+        bbwarn "patch_uefi_dtbs_cert: no DTBs with QcCapsuleRootCert found in $(basename ${uefi_dtbs_xz}); skipping."
+        rm -f "${uefi_dtbs_elf}"
+        return
+    fi
+
+    # Build a single --modify argument: one op per target, joined by '&'.
+    local modify_arg=""
+    local t
+    for t in ${targets}; do
+        if [ -z "${modify_arg}" ]; then
+            modify_arg="${t}=${QDTE_CERT_VALUE}"
+        else
+            modify_arg="${modify_arg}&${t}=${QDTE_CERT_VALUE}"
+        fi
+    done
+
+    local qdte_outdir="${CAPSULE_DIR}/qdte_uefi_dtbs_out"
+    rm -rf "${qdte_outdir}"
+    mkdir -p "${qdte_outdir}"
+
+    qdte --nogui \
+        --allow_unsigned \
+        --input_file  "${uefi_dtbs_elf}" \
+        --output_path "${qdte_outdir}" \
+        --output_file "uefi_dtbs.elf" \
+        --modify "${modify_arg}"
+
+    # Re-compress the patched ELF back over the staged uefi_dtbs.xz so the
+    # capsule FV picks up the cert-bearing version.
+    rm -f "${uefi_dtbs_elf}" "${uefi_dtbs_xz}"
+    xz -k "${qdte_outdir}/uefi_dtbs.elf"
+    install -m 0644 "${qdte_outdir}/uefi_dtbs.elf.xz" "${uefi_dtbs_xz}"
+    touch "${CAPSULE_DIR}/.uefi_dtbs_with_oem_cert"
+}
+
 do_compile() {
     CBSP_DATA="${STAGING_DATADIR_NATIVE}/cbsp-boot-utilities"
     EDK2_BASETOOLS="${STAGING_DATADIR_NATIVE}/edk2-basetools"
@@ -299,6 +433,14 @@ do_compile() {
     # without xbl_config.elf (e.g. hamoa) skip this step.
     if [ -f "${BOOTBINS_STAGED}/xbl_config.elf" ]; then
         patch_xblconfig_cert "${BOOTBINS_STAGED}/xbl_config.elf"
+    fi
+
+    # Inject OEM root cert into uefi_dtbs.elf when present.  Newer platforms
+    # (e.g. hamoa) carry QcCapsuleRootCert here instead of xbl_config.elf;
+    # uefi_dtbs.xz may live in a subdir (e.g. spinor/) of the boot bins.
+    UEFI_DTBS_XZ=$(find "${BOOTBINS_STAGED}" -name "uefi_dtbs.xz" -print -quit)
+    if [ -n "${UEFI_DTBS_XZ}" ]; then
+        patch_uefi_dtbs_cert "${UEFI_DTBS_XZ}"
     fi
 
     qcom-capsule-tool sysfw-version-create \
@@ -349,6 +491,16 @@ do_deploy() {
     if [ -f "${CAPSULE_DIR}/.xbl_with_oem_cert" ]; then
         install -m 0644 "${CAPSULE_DIR}/bootbins/xbl_config.elf" \
             "${DEPLOYDIR}/xbl_config-with-oem-cert.elf"
+    fi
+
+    # Likewise deploy the cert-injected uefi_dtbs under a distinct name for
+    # platforms that carry QcCapsuleRootCert in uefi_dtbs.elf (e.g. hamoa).
+    if [ -f "${CAPSULE_DIR}/.uefi_dtbs_with_oem_cert" ]; then
+        UEFI_DTBS_DEPLOY=$(find "${CAPSULE_DIR}/bootbins" -name "uefi_dtbs.xz" -print -quit)
+        if [ -n "${UEFI_DTBS_DEPLOY}" ]; then
+            install -m 0644 "${UEFI_DTBS_DEPLOY}" \
+                "${DEPLOYDIR}/uefi_dtbs-with-oem-cert.xz"
+        fi
     fi
 }
 addtask deploy before do_build after do_compile
