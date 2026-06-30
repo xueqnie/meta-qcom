@@ -12,6 +12,7 @@ SRC_URI = " \
     file://0003-controller-guard-quts2-lookup-on-Linux.patch \
     file://0004-dtwrapper-support-upstream-pyfdt-s-zero-arg-to_dtb.patch \
     file://0005-dtwrapper-accept-hex-oct-bin-literals-in-FdtProperty.patch \
+    file://0006-version_2_assemble-reassemble-uefi_dtbs-without-sectools.patch \
 "
 SRCREV = "7e3e493250c6a69a83e4f25dcb37d120e77f9dd8"
 
